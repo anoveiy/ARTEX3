@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"mime"
 	"net/http"
 	"net/url"
 	"os"
@@ -79,7 +80,87 @@ func pathInt(r *http.Request, name string) (int64, bool) {
 	return n, err == nil
 }
 
-func decode(r *http.Request, v any) error { return json.NewDecoder(r.Body).Decode(v) }
+// decodeMaxBytes is the default JSON body cap. Multipart uploads are not capped
+// here; those handlers set their own limit. A smaller MaxBytesReader installed
+// by a handler still wins, because it sits inside this one.
+const decodeMaxBytes = 32 << 20
+
+// limitedBody records a MaxBytesError so a later 400 can be answered as 413.
+type limitedBody struct {
+	io.ReadCloser
+	tooLarge bool
+}
+
+func (b *limitedBody) Read(p []byte) (int, error) {
+	n, err := b.ReadCloser.Read(p)
+	var tooLarge *http.MaxBytesError
+	if errors.As(err, &tooLarge) {
+		b.tooLarge = true
+	}
+	return n, err
+}
+
+type bodyLimitWriter struct {
+	http.ResponseWriter
+	tooLarge func() bool
+}
+
+func (b *bodyLimitWriter) WriteHeader(code int) {
+	if code == http.StatusBadRequest && b.tooLarge != nil && b.tooLarge() {
+		code = http.StatusRequestEntityTooLarge
+	}
+	b.ResponseWriter.WriteHeader(code)
+}
+
+func (b *bodyLimitWriter) Flush() {
+	if f, ok := b.ResponseWriter.(http.Flusher); ok {
+		f.Flush()
+	}
+}
+
+func (b *bodyLimitWriter) Unwrap() http.ResponseWriter { return b.ResponseWriter }
+
+// limitRequestBody caps a non-multipart body at decodeMaxBytes and passes the
+// real ResponseWriter into MaxBytesReader. A handler that then answers 400 for
+// that read is rewritten to 413.
+func limitRequestBody(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Body == nil || r.Body == http.NoBody || isMultipart(r) {
+			next.ServeHTTP(w, r)
+			return
+		}
+		body := &limitedBody{ReadCloser: http.MaxBytesReader(w, r.Body, decodeMaxBytes)}
+		r.Body = body
+		next.ServeHTTP(&bodyLimitWriter{ResponseWriter: w, tooLarge: func() bool { return body.tooLarge }}, r)
+	})
+}
+
+func isMultipart(r *http.Request) bool {
+	media, _, err := mime.ParseMediaType(r.Header.Get("Content-Type"))
+	if err != nil {
+		return false
+	}
+	return strings.HasPrefix(media, "multipart/")
+}
+
+func decode(w http.ResponseWriter, r *http.Request, v any) error {
+	if r.Body != nil {
+		if _, already := r.Body.(*limitedBody); !already {
+			r.Body = &limitedBody{ReadCloser: http.MaxBytesReader(w, r.Body, decodeMaxBytes)}
+		}
+	}
+	err := json.NewDecoder(r.Body).Decode(v)
+	var tooLarge *http.MaxBytesError
+	if errors.As(err, &tooLarge) {
+		if lb, ok := r.Body.(*limitedBody); ok {
+			lb.tooLarge = true
+		}
+		// Return the original error: a caller that maps 413 itself keeps working,
+		// and the middleware still rewrites a 400 for callers that do not.
+		return tooLarge
+	}
+	return err
+}
 
 // ---------- tasks (delete) ----------
 
@@ -138,7 +219,7 @@ func (s *Server) pgDeleteTask(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	var opts DeleteTaskOptions
-	if err := decode(r, &opts); err != nil && err != io.EOF {
+	if err := decode(w, r, &opts); err != nil && err != io.EOF {
 		writeErr(w, 400, "invalid JSON: "+err.Error())
 		return
 	}
@@ -250,7 +331,7 @@ func (s *Server) pgCreateAgent(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	var req struct{ Key, Name, Description string }
-	if err := decode(r, &req); err != nil {
+	if err := decode(w, r, &req); err != nil {
 		writeErr(w, 400, err.Error())
 		return
 	}
@@ -290,7 +371,7 @@ func (s *Server) pgUpdateAgent(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	var req struct{ Name, Description string }
-	if err := decode(r, &req); err != nil {
+	if err := decode(w, r, &req); err != nil {
 		writeErr(w, 400, err.Error())
 		return
 	}
@@ -516,7 +597,7 @@ func (s *Server) pgSavePrompt(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	var body struct{ Template, Note string }
-	if err := decode(r, &body); err != nil {
+	if err := decode(w, r, &body); err != nil {
 		writeErr(w, 400, err.Error())
 		return
 	}
@@ -565,7 +646,7 @@ func (s *Server) pgSaveWrapup(w http.ResponseWriter, r *http.Request) {
 		Prompt   string `json:"prompt"`
 		MaxTurns *int   `json:"max_turns"`
 	}
-	if err := decode(r, &body); err != nil {
+	if err := decode(w, r, &body); err != nil {
 		writeErr(w, 400, err.Error())
 		return
 	}
@@ -619,7 +700,7 @@ func (s *Server) pgSaveTaskTimeoutWrapup(w http.ResponseWriter, r *http.Request)
 		Prompt   string `json:"prompt"`
 		MaxTurns *int   `json:"max_turns"`
 	}
-	if err := decode(r, &body); err != nil {
+	if err := decode(w, r, &body); err != nil {
 		writeErr(w, 400, err.Error())
 		return
 	}
@@ -689,7 +770,7 @@ func (s *Server) pgPreviewPrompt(w http.ResponseWriter, r *http.Request) {
 		Template string            `json:"template"`
 		Sample   map[string]string `json:"sample"`
 	}
-	_ = decode(r, &body)
+	_ = decode(w, r, &body)
 	vars, _ := pg.PromptVars(a.ID)
 	if body.Template == "" {
 		body.Template, _ = pg.CurrentPrompt(a.ID)
@@ -724,7 +805,7 @@ func (s *Server) pgSetAgentVisibility(w http.ResponseWriter, r *http.Request) {
 		MCP   []int64  `json:"mcp"`
 		Skill []string `json:"skill"`
 	}
-	if err := decode(r, &body); err != nil {
+	if err := decode(w, r, &body); err != nil {
 		writeErr(w, 400, err.Error())
 		return
 	}
@@ -753,6 +834,11 @@ func (s *Server) pgListTools(w http.ResponseWriter, r *http.Request) {
 	}
 	if ts == nil {
 		ts = []*db.Tool{}
+	}
+	for _, tool := range ts {
+		if !tool.System {
+			tool.Exec = maskToolExec(tool.Exec)
+		}
 	}
 	// Usage is best-effort decoration. Runtime tool resolution keeps using the plain
 	// catalog query, so agent assembly never pays for this aggregate.
@@ -792,7 +878,7 @@ func (s *Server) pgUpdateTool(w http.ResponseWriter, r *http.Request) {
 		Agents      []string        `json:"agents"`
 		Enabled     bool            `json:"enabled"`
 	}
-	if err := decode(r, &body); err != nil {
+	if err := decode(w, r, &body); err != nil {
 		writeErr(w, 400, err.Error())
 		return
 	}
@@ -862,6 +948,26 @@ func (s *Server) pgListMCP(w http.ResponseWriter, r *http.Request) {
 		m.Env = maskMCPEnv(m.Env)
 	}
 	writeJSON(w, 200, map[string]any{"servers": ms})
+}
+
+// maskedSecret is what a response shows for a stored secret such as a proxy
+// URL: the whole value is replaced by the placeholder, "" stays "".
+func maskedSecret(v string) string {
+	if v == "" {
+		return ""
+	}
+	return notify.MaskedPrefix
+}
+
+// isMaskedSecret reports a placeholder sent back on write: keep the stored value.
+func isMaskedSecret(v string) bool { return notify.IsMasked(strings.TrimSpace(v)) }
+
+// keepIfMasked turns a placeholder in an optional field into nil (keep).
+func keepIfMasked(v *string) *string {
+	if v != nil && isMaskedSecret(*v) {
+		return nil
+	}
+	return v
 }
 
 // maskMCPEnv replaces every non-empty env value (API keys, auth headers) with
@@ -938,7 +1044,7 @@ func (s *Server) pgSaveMCP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	var m db.MCPServer
-	if err := decode(r, &m); err != nil {
+	if err := decode(w, r, &m); err != nil {
 		writeErr(w, 400, err.Error())
 		return
 	}
@@ -1050,7 +1156,7 @@ type skillFileNode struct {
 
 func (s *Server) fsListSkills(w http.ResponseWriter, r *http.Request) {
 	_ = os.MkdirAll(s.skillDir, 0o755)
-	allReg, _ := skill.LoadDir(s.skillDir)
+	allReg, _ := loadSkillsConfined(s.skillDir)
 	metaByDir := map[string]skill.Skill{}
 	if allReg != nil {
 		for _, sk := range allReg.List() {
@@ -1061,7 +1167,7 @@ func (s *Server) fsListSkills(w http.ResponseWriter, r *http.Request) {
 	}
 	entries, err := os.ReadDir(s.skillDir)
 	if err != nil {
-		writeErr(w, 500, err.Error())
+		writeErr(w, 500, safeFSErr(err))
 		return
 	}
 	// Usage is best-effort decoration: a ledger read failure leaves the counts at
@@ -1157,7 +1263,7 @@ func (s *Server) fsCreateSkill(w http.ResponseWriter, r *http.Request) {
 		MCPs          []string `json:"mcps"`          // optional; MCP servers this skill unlocks
 		Instructions  string   `json:"instructions"`  // optional; scaffolded if empty
 	}
-	if err := decode(r, &body); err != nil {
+	if err := decode(w, r, &body); err != nil {
 		writeErr(w, 400, err.Error())
 		return
 	}
@@ -1169,13 +1275,18 @@ func (s *Server) fsCreateSkill(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, 400, "description is required")
 		return
 	}
-	skillPath := filepath.Join(s.skillDir, body.Name)
-	if _, err := os.Stat(skillPath); err == nil {
+	dirCP, err := resolveSkillDir(s.skillDir, body.Name)
+	if err != nil {
+		writeErr(w, 400, "invalid path")
+		return
+	}
+	if dirCP.exists {
 		writeErr(w, 409, "skill already exists")
 		return
 	}
+	skillPath := filepath.Join(s.skillDir, body.Name)
 	if err := os.MkdirAll(skillPath, 0o755); err != nil {
-		writeErr(w, 500, err.Error())
+		writeErr(w, 500, safeFSErr(err))
 		return
 	}
 	// Build a spec-compliant SKILL.md (agentskills.io format):
@@ -1211,7 +1322,7 @@ func (s *Server) fsCreateSkill(w http.ResponseWriter, r *http.Request) {
 	}
 	if err := os.WriteFile(filepath.Join(skillPath, "SKILL.md"), []byte(sb.String()), 0o644); err != nil {
 		_ = os.RemoveAll(skillPath)
-		writeErr(w, 500, err.Error())
+		writeErr(w, 500, safeFSErr(err))
 		return
 	}
 	// Verify with the real parser: a description containing ": " (or any value that
@@ -1242,14 +1353,26 @@ func (s *Server) fsUpdateSkillMeta(w http.ResponseWriter, r *http.Request) {
 		License       *string   `json:"license"`
 		Compatibility *string   `json:"compatibility"`
 	}
-	if err := decode(r, &body); err != nil {
+	if err := decode(w, r, &body); err != nil {
 		writeErr(w, 400, err.Error())
 		return
 	}
-	skillMD := filepath.Join(s.skillDir, name, "SKILL.md")
-	raw, err := os.ReadFile(skillMD)
+	skillExists, cp, err := resolveSkillFile(s.skillDir, name, "SKILL.md")
 	if err != nil {
+		writeErr(w, 400, "invalid path")
+		return
+	}
+	if !skillExists || !cp.exists {
 		writeErr(w, 404, "skill not found")
+		return
+	}
+	raw, err := os.ReadFile(cp.realPath)
+	if err != nil {
+		if os.IsNotExist(err) {
+			writeErr(w, 404, "skill not found")
+			return
+		}
+		writeErr(w, 500, safeFSErr(err))
 		return
 	}
 	updated, err := rewriteSkillFrontmatter(raw, body.MCPs, body.Description, body.License, body.Compatibility)
@@ -1257,8 +1380,8 @@ func (s *Server) fsUpdateSkillMeta(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, 400, err.Error())
 		return
 	}
-	if err := os.WriteFile(skillMD, updated, 0o644); err != nil {
-		writeErr(w, 500, err.Error())
+	if err := os.WriteFile(cp.realPath, updated, 0o644); err != nil {
+		writeErr(w, 500, safeFSErr(err))
 		return
 	}
 	writeJSON(w, 200, map[string]any{"ok": true})
@@ -1277,9 +1400,9 @@ func yamlScalar(s string) string {
 // verifySkillFile re-loads a written SKILL.md with the real skill parser and
 // asserts the name and the mcps list survived the round trip.
 func verifySkillFile(skillPath, wantName string, wantMCPs []string) error {
-	reg, err := skill.LoadDir(skillPath)
+	reg, err := loadSkillsConfined(skillPath)
 	if err != nil {
-		return fmt.Errorf("load: %w", err)
+		return fmt.Errorf("load: %s", safeFSErr(err))
 	}
 	for _, s := range reg.List() {
 		if s.Dir == "" {
@@ -1293,14 +1416,14 @@ func verifySkillFile(skillPath, wantName string, wantMCPs []string) error {
 		}
 		return nil
 	}
-	return fmt.Errorf("no skill loaded from %s", skillPath)
+	return fmt.Errorf("no skill loaded from %s", filepath.Base(skillPath))
 }
 
 // warnBrokenSkills logs skills whose parsed name does not match their directory
 // name: the signature of frontmatter that failed to parse and silently fell back
 // (fields empty, mcps gate lost). Best-effort, startup only.
 func warnBrokenSkills(dir string) {
-	reg, err := skill.LoadDir(dir)
+	reg, err := loadSkillsConfined(dir)
 	if err != nil {
 		return
 	}
@@ -1495,9 +1618,14 @@ func (s *Server) fsUploadSkill(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	dirCP, err := resolveSkillDir(s.skillDir, name)
+	if err != nil {
+		writeErr(w, 400, "invalid path")
+		return
+	}
 	skillPath := filepath.Join(s.skillDir, name)
 	overwrite := r.URL.Query().Get("overwrite") == "true"
-	if _, err := os.Stat(skillPath); err == nil && !overwrite {
+	if dirCP.exists && !overwrite {
 		writeErr(w, 409, "skill already exists: "+name+" (retry after confirming if you want to overwrite)")
 		return
 	}
@@ -1602,13 +1730,20 @@ func (s *Server) fsDeleteSkill(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, 400, "invalid skill name")
 		return
 	}
+	dirCP, err := resolveSkillDir(s.skillDir, name)
+	if err != nil {
+		writeErr(w, 400, "invalid path")
+		return
+	}
 	if err := pg.DeleteSkillVisibility(name); err != nil {
 		writeErr(w, 500, err.Error())
 		return
 	}
-	if err := os.RemoveAll(filepath.Join(s.skillDir, name)); err != nil {
-		writeErr(w, 500, err.Error())
-		return
+	if dirCP.exists {
+		if err := os.RemoveAll(dirCP.entryPath); err != nil {
+			writeErr(w, 500, safeFSErr(err))
+			return
+		}
 	}
 	writeJSON(w, 200, map[string]any{"deleted": name})
 }
@@ -1710,14 +1845,23 @@ func (s *Server) fsListFiles(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, 400, "invalid skill name")
 		return
 	}
-	dirPath := filepath.Join(s.skillDir, name)
-	if _, err := os.Stat(dirPath); os.IsNotExist(err) {
+	dirCP, err := resolveSkillDir(s.skillDir, name)
+	if err != nil {
+		writeErr(w, 400, "invalid path")
+		return
+	}
+	if !dirCP.exists {
 		writeErr(w, 404, "skill not found")
 		return
 	}
-	files, err := walkSkillFiles(dirPath)
+	fi, err := os.Stat(dirCP.realPath)
+	if err != nil || !fi.IsDir() {
+		writeErr(w, 404, "skill not found")
+		return
+	}
+	files, err := walkSkillFiles(dirCP.realPath)
 	if err != nil {
-		writeErr(w, 500, err.Error())
+		writeErr(w, 500, safeFSErr(err))
 		return
 	}
 	if files == nil {
@@ -1737,13 +1881,22 @@ func (s *Server) fsReadFile(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, 400, errMsg)
 		return
 	}
-	data, err := os.ReadFile(filepath.Join(s.skillDir, name, file))
+	skillExists, cp, err := resolveSkillFile(s.skillDir, name, file)
+	if err != nil {
+		writeErr(w, 400, "invalid path")
+		return
+	}
+	if !skillExists || !cp.exists {
+		writeErr(w, 404, "file not found")
+		return
+	}
+	data, err := os.ReadFile(cp.realPath)
 	if os.IsNotExist(err) {
 		writeErr(w, 404, "file not found")
 		return
 	}
 	if err != nil {
-		writeErr(w, 500, err.Error())
+		writeErr(w, 500, safeFSErr(err))
 		return
 	}
 	writeJSON(w, 200, map[string]any{"content": string(data), "file": file})
@@ -1763,23 +1916,30 @@ func (s *Server) fsWriteFile(w http.ResponseWriter, r *http.Request) {
 	var body struct {
 		Content string `json:"content"`
 	}
-	if err := decode(r, &body); err != nil {
+	if err := decode(w, r, &body); err != nil {
 		writeErr(w, 400, err.Error())
 		return
 	}
-	skillPath := filepath.Join(s.skillDir, name)
-	if _, err := os.Stat(skillPath); os.IsNotExist(err) {
+	skillExists, cp, err := resolveSkillFile(s.skillDir, name, file)
+	if err != nil {
+		writeErr(w, 400, "invalid path")
+		return
+	}
+	if !skillExists {
 		writeErr(w, 404, "skill not found")
 		return
 	}
-	fullPath := filepath.Join(skillPath, file)
-	// create parent subdirectory if needed (e.g. scripts/, references/, assets/)
-	if err := os.MkdirAll(filepath.Dir(fullPath), 0o755); err != nil {
-		writeErr(w, 500, err.Error())
+	if cp.realPath == cp.realRoot {
+		writeErr(w, 400, "invalid path")
 		return
 	}
-	if err := os.WriteFile(fullPath, []byte(body.Content), 0o644); err != nil {
-		writeErr(w, 500, err.Error())
+	// create parent subdirectory if needed (e.g. scripts/, references/, assets/)
+	if err := os.MkdirAll(filepath.Dir(cp.realPath), 0o755); err != nil {
+		writeErr(w, 500, safeFSErr(err))
+		return
+	}
+	if err := os.WriteFile(cp.realPath, []byte(body.Content), 0o644); err != nil {
+		writeErr(w, 500, safeFSErr(err))
 		return
 	}
 	writeJSON(w, 200, map[string]any{"ok": true})
@@ -1794,7 +1954,7 @@ func (s *Server) fsCreateDir(w http.ResponseWriter, r *http.Request) {
 	var body struct {
 		Path string `json:"path"`
 	}
-	if err := decode(r, &body); err != nil {
+	if err := decode(w, r, &body); err != nil {
 		writeErr(w, 400, err.Error())
 		return
 	}
@@ -1803,13 +1963,21 @@ func (s *Server) fsCreateDir(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, 400, errMsg)
 		return
 	}
-	skillPath := filepath.Join(s.skillDir, name)
-	if _, err := os.Stat(skillPath); os.IsNotExist(err) {
+	skillExists, cp, err := resolveSkillFile(s.skillDir, name, dir)
+	if err != nil {
+		writeErr(w, 400, "invalid path")
+		return
+	}
+	if !skillExists {
 		writeErr(w, 404, "skill not found")
 		return
 	}
-	if err := os.MkdirAll(filepath.Join(skillPath, dir), 0o755); err != nil {
-		writeErr(w, 500, err.Error())
+	if cp.realPath == cp.realRoot {
+		writeErr(w, 400, "invalid path")
+		return
+	}
+	if err := os.MkdirAll(cp.realPath, 0o755); err != nil {
+		writeErr(w, 500, safeFSErr(err))
 		return
 	}
 	writeJSON(w, 201, map[string]any{"dir": dir})
@@ -1826,13 +1994,21 @@ func (s *Server) fsDeletePath(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, 400, errMsg)
 		return
 	}
-	fullPath := filepath.Join(s.skillDir, name, file)
-	if _, err := os.Stat(fullPath); os.IsNotExist(err) {
+	skillExists, cp, err := resolveSkillFile(s.skillDir, name, file)
+	if err != nil {
+		writeErr(w, 400, "invalid path")
+		return
+	}
+	if !skillExists || !cp.exists {
 		writeErr(w, 404, "not found")
 		return
 	}
-	if err := os.RemoveAll(fullPath); err != nil {
-		writeErr(w, 500, err.Error())
+	if cp.realPath == cp.realRoot {
+		writeErr(w, 400, "invalid path")
+		return
+	}
+	if err := os.RemoveAll(cp.entryPath); err != nil {
+		writeErr(w, 500, safeFSErr(err))
 		return
 	}
 	writeJSON(w, 200, map[string]any{"deleted": file})
@@ -1863,7 +2039,7 @@ func (s *Server) pgToggleSkillVisibility(w http.ResponseWriter, r *http.Request)
 		SkillName string `json:"skill_name"`
 		Visible   bool   `json:"visible"`
 	}
-	if err := decode(r, &body); err != nil {
+	if err := decode(w, r, &body); err != nil {
 		writeErr(w, 400, err.Error())
 		return
 	}
@@ -1901,7 +2077,7 @@ func (s *Server) pgToggleVisibility(w http.ResponseWriter, r *http.Request) {
 		ResourceID int64  `json:"resource_id"`
 		Visible    bool   `json:"visible"`
 	}
-	if err := decode(r, &body); err != nil {
+	if err := decode(w, r, &body); err != nil {
 		writeErr(w, 400, err.Error())
 		return
 	}
@@ -1942,13 +2118,23 @@ func (s *Server) pgSaveProfile(w http.ResponseWriter, r *http.Request) {
 		APIKey    string `json:"api_key"`
 		Streaming *bool  `json:"streaming"`
 	}
-	if err := decode(r, &body); err != nil {
+	if err := decode(w, r, &body); err != nil {
 		writeErr(w, 400, err.Error())
 		return
 	}
 	p := body.LLMProfile
 	p.APIKey = body.APIKey
 	p.Streaming = body.Streaming == nil || *body.Streaming
+	// The list returns the proxy masked: the placeholder sent back keeps the
+	// stored proxy and is never stored itself.
+	if isMaskedSecret(p.Proxy) {
+		stored, err := pg.ProfileByID(p.ID)
+		if p.ID == 0 || err != nil || stored == nil {
+			writeErr(w, 400, "proxy is a masked placeholder but no stored proxy to keep; enter the proxy or clear it")
+			return
+		}
+		p.Proxy = stored.Proxy
+	}
 	// Output cap: negative values are meaningless, clamp to zero (= do not send the
 	// field). The field-name switch only matters for Chat Completions — anthropic and
 	// openai-responses hard-code their field names; storing it would only mislead later readers, so it is cleared for any non-openai format. Unknown values are cleared too, to avoid throwing DB CHECK errors at the user.
@@ -2001,7 +2187,7 @@ func (s *Server) pgSaveLLMRetryPolicy(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	var pol db.LLMRetryPolicy
-	if err := decode(r, &pol); err != nil {
+	if err := decode(w, r, &pol); err != nil {
 		writeErr(w, 400, err.Error())
 		return
 	}
@@ -2073,7 +2259,7 @@ func (s *Server) pgActivateProfile(w http.ResponseWriter, r *http.Request) {
 	var body struct {
 		ID int64 `json:"id"`
 	}
-	if err := decode(r, &body); err != nil {
+	if err := decode(w, r, &body); err != nil {
 		writeErr(w, 400, err.Error())
 		return
 	}
@@ -2106,7 +2292,7 @@ func (s *Server) pgLLMPoolReset(w http.ResponseWriter, r *http.Request) {
 	var body struct {
 		ID int64 `json:"id"` // 0 / omitted = all
 	}
-	if err := decode(r, &body); err != nil {
+	if err := decode(w, r, &body); err != nil {
 		writeErr(w, 400, err.Error())
 		return
 	}
@@ -2133,7 +2319,7 @@ func (s *Server) pgListModels(w http.ResponseWriter, r *http.Request) {
 		Proxy     string `json:"proxy"`
 		ProfileID *int64 `json:"profile_id"` // fallback: use stored key from this profile
 	}
-	if err := decode(r, &req); err != nil {
+	if err := decode(w, r, &req); err != nil {
 		writeErr(w, 400, err.Error())
 		return
 	}
@@ -2147,6 +2333,14 @@ func (s *Server) pgListModels(w http.ResponseWriter, r *http.Request) {
 				apiKey = p.APIKey
 			} else {
 				withheld = p.APIKey != ""
+			}
+		}
+	}
+	if isMaskedSecret(req.Proxy) { // the form echoes the masked proxy: use the stored one
+		req.Proxy = ""
+		if req.ProfileID != nil {
+			if p, err := s.m.pg.ProfileByID(*req.ProfileID); err == nil && p != nil {
+				req.Proxy = p.Proxy
 			}
 		}
 	}

@@ -24,7 +24,7 @@ func TestRecordFactSourceSchemaUpgrade(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
 	s := New(ctx, m, t.TempDir(), t.TempDir(), t.TempDir())
-	t.Cleanup(func() { agent.ToolResolve = nil })
+	t.Cleanup(func() { agent.SetToolResolve(nil) })
 	pg := m.pg
 
 	old, err := pg.GetTool("record_fact")
@@ -47,8 +47,8 @@ func TestRecordFactSourceSchemaUpgrade(t *testing.T) {
 	if err := pg.UpdateTool("record_fact", "operator description", custom, bindings, true); err != nil {
 		t.Fatal(err)
 	}
-	if src := resolvedRecordFactProps(t)["source"]; src != nil {
-		t.Fatalf("precondition: stored schema should not expose source yet: %v", src)
+	if src := resolvedRecordFactProps(t)["source"]; src == nil {
+		t.Fatal("runtime contract repair must expose source even before startup migration")
 	}
 
 	snapshot := func() (string, string, time.Time) {
@@ -96,7 +96,7 @@ func TestRecordFactSourceSchemaUpgrade(t *testing.T) {
 // serves it to the worker.
 func resolvedRecordFactProps(t *testing.T) map[string]any {
 	t.Helper()
-	tools := agent.ToolResolve(context.Background(), "worker", agent.NewToolSet(nil, "").WorkerTools())
+	tools := agent.ToolResolve()(context.Background(), "worker", agent.NewToolSet(nil, "").WorkerTools())
 	for _, tl := range tools {
 		if tl.Name() == "record_fact" {
 			props, _ := tl.InputSchema()["properties"].(map[string]any)

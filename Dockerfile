@@ -145,29 +145,49 @@ RUN set -eux; \
 # preinstalled (--install-all-deps) so scans never need pip at runtime, which
 # would fail under a program's egress allowlist.
 ARG BBOT_VERSION=3.0.2
+# arm64: bbot's Chrome and retirejs's Node are x86-64; use native builds.
 RUN set -eux; \
     python -m venv /opt/bbot; \
     /opt/bbot/bin/pip install --no-cache-dir "bbot==${BBOT_VERSION}"; \
     ln -s /opt/bbot/bin/bbot /usr/local/bin/bbot; \
+    if [ "${TARGETARCH:-amd64}" = "arm64" ]; then \
+      apt-get update; \
+      apt-get install -y --no-install-recommends chromium; \
+      rm -rf /var/lib/apt/lists/*; \
+      bbot_dir="$(/opt/bbot/bin/python -c 'import bbot, os; print(os.path.dirname(bbot.__file__))')"; \
+      sed -i 's/linux-x64/linux-arm64/g' "$bbot_dir/modules/retirejs.py"; \
+    fi; \
     bbot -y --install-all-deps; \
+    if [ "${TARGETARCH:-amd64}" = "arm64" ]; then \
+      printf '\nmodules:\n  gowitness:\n    chrome_path: /usr/bin/chromium\n' >> /root/.config/bbot/bbot.yml; \
+    fi; \
     bbot --version >/dev/null; \
-    bbot --dry-run -t example.com -m wafw00f,paramminer_getparams,lightfuzz,sslcert,gowitness >/dev/null 2>&1 || true; \
-    bbot --dry-run -t example.com -m wafw00f,paramminer_getparams,lightfuzz,sslcert,gowitness --no-color >/tmp/bbot-dry.log 2>&1 || true; \
+    bbot --dry-run -t example.com -m wafw00f,paramminer_getparams,lightfuzz,sslcert,gowitness,retirejs >/dev/null 2>&1 || true; \
+    bbot --dry-run -t example.com -m wafw00f,paramminer_getparams,lightfuzz,sslcert,gowitness,retirejs --no-color >/tmp/bbot-dry.log 2>&1 || true; \
     ! grep -qE "Installing|ERRR|CRITICAL" /tmp/bbot-dry.log || { cat /tmp/bbot-dry.log; exit 1; }
 
 
-# Preinstall Playwright MCP and CLI (globally) so no npx network download is needed at runtime.
-# @playwright/mcp: browser MCP runs directly via `npx @playwright/mcp` (installed globally, no -y/@latest needed).
+# Preinstall Playwright MCP and CLI (globally) so no network download is needed at runtime.
+# @playwright/mcp: the seeded browser MCP runs the playwright-mcp binary directly.
+# `npx @playwright/mcp` is not used: it queries the npm registry on every start even
+# with the package installed globally.
 # @playwright/cli: provides playwright-cli, verified with --help right after install.
 # Then install playwright (browser management) and preinstall chromium plus its system
-# dependencies via --with-deps, so MCP/CLI work on first start inside the container
-# without downloading browsers over the network. All three are pinned; upgrade deliberately.
+# dependencies via --with-deps. @playwright/mcp and @playwright/cli bundle their own
+# playwright-core, which expects a different Chromium build than
+# playwright@PLAYWRIGHT_VERSION installs, so that build is installed as well (second
+# install line); without it neither can launch a browser. All three packages are
+# pinned; upgrade deliberately.
 ARG PLAYWRIGHT_MCP_VERSION=0.0.83
 ARG PLAYWRIGHT_CLI_VERSION=0.1.22
 ARG PLAYWRIGHT_VERSION=1.64.1
+# playwright-core's exports map hides cli.js from require.resolve, so run the
+# binary npm links for @playwright/mcp instead: it is the copy MCP actually
+# loads, and it installs the Chromium revision that copy expects.
 RUN npm install -g "@playwright/mcp@${PLAYWRIGHT_MCP_VERSION}" "@playwright/cli@${PLAYWRIGHT_CLI_VERSION}" "playwright@${PLAYWRIGHT_VERSION}" \
     && playwright-cli --help \
     && playwright install --with-deps chromium \
+    && "$(npm root -g)/@playwright/mcp/node_modules/.bin/playwright-core" install chromium \
     && rm -rf /var/lib/apt/lists/*
 WORKDIR /app
 # Binary compiled from source in the build stage above.
@@ -178,7 +198,7 @@ COPY --from=build /out/artex /app/artex
 COPY start.sh /app/start.sh
 RUN chmod +x /app/artex /app/start.sh && mkdir -p /app/keys
 COPY skills/ /app/skills/
-# persistence points: data/ (SQLite, task files) and keys/ (jwt.key, via ARTEX_JWT_KEY_DIR)
+# persistence points: data/ (traffic index, task files, transcripts) and keys/ (jwt.key, secret.key, via ARTEX_JWT_KEY_DIR)
 VOLUME ["/app/data", "/app/keys"]
 EXPOSE 8787 8788
 ENTRYPOINT ["/app/start.sh"]

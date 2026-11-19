@@ -2,8 +2,10 @@ package agent
 
 import (
 	"context"
+	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 	"time"
 
 	"github.com/Autumn-27/artex/db"
@@ -98,6 +100,33 @@ func chatSystem(agentKey, dataDir, workDir string) string {
 // DefaultAssistantPrompt.
 type chatVars struct{ DataDir, Now string }
 
+const maxChatSessionID = 64
+
+// validChatSessionID is the session-directory name contract. Production uses
+// "conv-" plus a decimal id; tests use hyphenated suffixes. Path separators
+// and ".." are rejected so Join cannot leave <workDir>/sessions.
+func validChatSessionID(id string) bool {
+	if id == "" || len(id) > maxChatSessionID {
+		return false
+	}
+	for i := 0; i < len(id); i++ {
+		c := id[i]
+		switch {
+		case c >= 'A' && c <= 'Z', c >= 'a' && c <= 'z', c >= '0' && c <= '9', c == '_', c == '-':
+		default:
+			return false
+		}
+	}
+	return true
+}
+
+func sessionDirInside(workDir, sessionWorkDir string) bool {
+	base := filepath.Clean(filepath.Join(workDir, "sessions"))
+	clean := filepath.Clean(sessionWorkDir)
+	sep := string(os.PathSeparator)
+	return clean == base || strings.HasPrefix(clean, base+sep)
+}
+
 // Chat runs ONE turn of a conversation with the agent identified by agentKey,
 // resuming prior history keyed by sessionID. maxTurns is the per-turn agent step
 // budget (0 = unlimited). maxDuration is the wall-clock run budget per turn
@@ -114,9 +143,15 @@ func (c *ChatAgent) Chat(ctx context.Context, agentKey, sessionID, message strin
 		ws.Enabled = false
 	}
 
+	if !validChatSessionID(sessionID) {
+		return "", fmt.Errorf("invalid session id %q", sessionID)
+	}
 	// Per-session working directory: <workDir>/sessions/<sessionID>/
 	// Isolates file writes across conversations, mirroring how workers use i<intentID>/.
 	sessionWorkDir := filepath.Join(c.workDir, "sessions", sessionID)
+	if !sessionDirInside(c.workDir, sessionWorkDir) {
+		return "", fmt.Errorf("invalid session id %q", sessionID)
+	}
 	_ = os.MkdirAll(sessionWorkDir, 0o755)
 	ctx = intercept.WithReviewWorkingDirectory(ctx, sessionWorkDir)
 
@@ -143,6 +178,8 @@ func (c *ChatAgent) Chat(ctx context.Context, agentKey, sessionID, message strin
 		WebSearchBackend:      ws.Backend,
 		BraveSearchAPIKey:     ws.BraveKey,
 		TavilySearchAPIKey:    ws.TavilyKey,
+		KeenableSearchAPIKey:  ws.KeenableKey,
+		KeenableSearchTitle:   KeenableSearchTitle,
 		DeepSeekSearchBaseURL: ws.DeepSeekBaseURL,
 		DeepSeekSearchAPIKey:  ws.DeepSeekAPIKey,
 		DeepSeekSearchModel:   ws.DeepSeekModel,
@@ -169,9 +206,12 @@ func (c *ChatAgent) Chat(ctx context.Context, agentKey, sessionID, message strin
 	if c.guard != nil {
 		opts.Hooks = c.guard.Hooks()
 	}
+	// The session id is the provider-side identity (session header, usage metering)
+	// with or without persistence; Norma only puts it on ctx when it writes a transcript.
+	opts.SessionID = sessionID
+	ctx = transcript.WithSessionID(ctx, opts.SessionID)
 	if c.tx != nil { // persist raw human↔AI conversation; one accumulating file per thread
 		opts.Transcript = c.tx
-		opts.SessionID = sessionID
 	}
 	// experimental feature: when enabled, noa takes over context compression (archive centralized under <workDir>/noa/<SessionID>, persistent).
 	enableNoa(&opts, c.noaEnabledFn, c.workDir, "chat-"+sessionID, noaWarn("chat-"+sessionID))
@@ -180,8 +220,11 @@ func (c *ChatAgent) Chat(ctx context.Context, agentKey, sessionID, message strin
 	defer s.Close()
 	// reload prior conversation so the agent has context across turns (each Chat is
 	// a fresh session). First turn: no file yet → Resume loads nothing and proceeds.
+	// A corrupt or unreadable transcript stops the turn before any model or tool call.
 	if c.tx != nil {
-		_ = s.Resume(sessionID)
+		if err := resumeSession(s, opts.SessionID); err != nil {
+			return "", err
+		}
 	}
 	// re-unlock skill-gated MCPs from prior Skill() calls in the reloaded history so
 	// revealed tools stay callable across the fresh session.

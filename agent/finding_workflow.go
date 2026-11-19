@@ -3,6 +3,7 @@ package agent
 import (
 	"encoding/json"
 	"fmt"
+	"sync"
 
 	"github.com/Autumn-27/artex/db"
 	actool "github.com/Autumn-27/norma/tool"
@@ -13,10 +14,29 @@ const findingIDGuidance = "\n\n**Finding ID conventions**: finding_id is the sta
 // The server supplies the persisted setting. A missing setting/host is off.
 // Consulted at assembly and again on writes so an already-running session
 // cannot keep binding after the user switches the feature off.
-var FindingTrafficBindingEnabled func() bool
+// Guarded by a lock for the same reason as the tool hooks.
+var (
+	findingTrafficBindingMu   sync.RWMutex
+	findingTrafficBindingHook func() bool
+)
+
+// SetFindingTrafficBindingEnabled installs (or, with nil, removes) the hook.
+func SetFindingTrafficBindingEnabled(f func() bool) {
+	findingTrafficBindingMu.Lock()
+	findingTrafficBindingHook = f
+	findingTrafficBindingMu.Unlock()
+}
+
+// FindingTrafficBindingEnabled returns the current hook, or nil when none is set.
+func FindingTrafficBindingEnabled() func() bool {
+	findingTrafficBindingMu.RLock()
+	defer findingTrafficBindingMu.RUnlock()
+	return findingTrafficBindingHook
+}
 
 func findingTrafficBindingEnabled() bool {
-	return FindingTrafficBindingEnabled != nil && FindingTrafficBindingEnabled()
+	f := FindingTrafficBindingEnabled()
+	return f != nil && f()
 }
 
 // Applied after ToolResolve: user descriptions and prompts remain intact, while
@@ -29,7 +49,7 @@ func findingWorkflowTools(agentKey string, tools []actool.CoreTool) ([]actool.Co
 			if tool.Name() == "bind_finding_traffic" {
 				continue
 			}
-			if agentKey == "reporter" && (tool.Name() == "traffic_search" || tool.Name() == "traffic_get" || tool.Name() == "traffic_blob") {
+			if agentKey == "reporter" && (tool.Name() == "traffic_search" || tool.Name() == "traffic_get" || tool.Name() == "traffic_blob" || tool.Name() == "traffic_messages") {
 				continue
 			}
 			switch tool.Name() {

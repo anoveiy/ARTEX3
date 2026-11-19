@@ -69,6 +69,26 @@ func WithUsageSink(ctx context.Context, sink func(llm.Usage)) context.Context {
 	return context.WithValue(ctx, usageSinkContextKey{}, sink)
 }
 
+type stopSinkContextKey struct{}
+
+// WithStopSink attaches a callback that receives the stop reason of every call
+// made under ctx that completes normally, once per call, after the provider's
+// last event ("" when the provider reported none). The harness keeps the stop
+// reason only long enough to decide whether a turn used tools, so a host that
+// must tell a provider refusal (Anthropic stop_reason "refusal", or
+// finish_reason "content_filter" on OpenAI-compatible endpoints) from an
+// ordinary end of turn observes it here.
+func WithStopSink(ctx context.Context, sink func(stopReason string)) context.Context {
+	return context.WithValue(ctx, stopSinkContextKey{}, sink)
+}
+
+// reportStop hands stopReason to the ctx stop sink, if one is attached.
+func reportStop(ctx context.Context, stopReason string) {
+	if sink, _ := ctx.Value(stopSinkContextKey{}).(func(string)); sink != nil {
+		sink(stopReason)
+	}
+}
+
 // Recorder wraps an llm.Provider and records every completion call.
 type Recorder struct {
 	inner llm.Provider
@@ -195,11 +215,11 @@ func (r *Recorder) Stream(ctx context.Context, req llm.CompletionRequest) iter.S
 				return
 			}
 			// Always track usage (cheap); accumulate text/thinking only for bodies.
-			// Anthropic (and the other providers) split token usage across events:
-			// message_start carries ONLY the input side (input + cache), message_delta
-			// ONLY the output. They must be FOLDED with Add — overwriting on delta
-			// would zero out the input already counted at start (mirrors the SDK's own
-			// llm.Accumulator; see norma/llm/accumulate.go).
+			// message_start carries the input side (input + cache) and is added.
+			// Since Norma v0.4.7 message_delta also echoes that input side next to the
+			// output, so it is folded with llm.Usage.MergeEcho (max on echoed fields,
+			// sum on output), as llm.Accumulator does; Add would count the input and
+			// cache twice. An output-only delta folds the same either way.
 			switch ev.Type {
 			case llm.SETextDelta:
 				if recordBodies {
@@ -215,7 +235,7 @@ func (r *Recorder) Stream(ctx context.Context, req llm.CompletionRequest) iter.S
 				if ev.StopReason != "" {
 					stopReason = ev.StopReason
 				}
-				usage.Add(ev.Usage)
+				usage.MergeEcho(ev.Usage)
 			}
 			if !yield(ev, err) {
 				return
@@ -223,6 +243,7 @@ func (r *Recorder) Stream(ctx context.Context, req llm.CompletionRequest) iter.S
 		}
 
 		// Stream completed normally.
+		reportStop(ctx, stopReason)
 		finish(streamErr)
 	}
 }
@@ -254,6 +275,8 @@ func (r *Recorder) Complete(ctx context.Context, req llm.CompletionRequest) (llm
 	status := "ok"
 	if err != nil {
 		status = "error"
+	} else {
+		reportStop(ctx, stopReason)
 	}
 	r.recordUsage(ctx, taskID, expID, worker, usage, int(time.Since(start).Milliseconds()), status)
 	if recordBodies {
